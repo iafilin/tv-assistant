@@ -54,6 +54,13 @@ jobs:
             -output "$APP/Contents/MacOS/tv-assistant"
           cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
           cp -R assets/icons "$APP/Contents/Resources/icons"
+          mkdir -p "$APP/Contents/Resources/platform-tools" dist/adb-temp
+          curl --fail --location --retry 2 \
+            "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip" \
+            --output dist/platform-tools-darwin.zip
+          unzip -q dist/platform-tools-darwin.zip -d dist/adb-temp
+          cp dist/adb-temp/platform-tools/adb "$APP/Contents/Resources/platform-tools/adb"
+          chmod +x "$APP/Contents/Resources/platform-tools/adb"
 
           qlmanage -t -s 1024 -o assets assets/AppIcon.svg >/dev/null
           mv assets/AppIcon.svg.png assets/AppIcon.png
@@ -77,6 +84,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/package/Resources" | Out-Null
           Copy-Item "target/x86_64-pc-windows-msvc/release/tv-assistant.exe" "dist/package/tv-assistant.exe"
           Copy-Item -Recurse "assets/icons" "dist/package/Resources/icons"
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile "dist/platform-tools-windows.zip"
+          Expand-Archive -Path "dist/platform-tools-windows.zip" -DestinationPath "dist/adb-temp" -Force
+          Copy-Item -Recurse "dist/adb-temp/platform-tools" "dist/package/platform-tools"
           Compress-Archive -Path "dist/package/*" -DestinationPath "dist/TV-Assistant-Windows-x64.zip" -Force
 
       - name: Upload macOS package

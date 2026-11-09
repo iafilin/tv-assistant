@@ -382,6 +382,22 @@ fn locate_adb() -> Option<PathBuf> {
     {
         return Some(path);
     }
+    if let Ok(current_executable) = env::current_exe() {
+        if let Some(bin) = current_executable.parent() {
+            for directory in [
+                bin.join("platform-tools"),
+                bin.join("Resources").join("platform-tools"),
+                bin.parent()
+                    .map(|contents| contents.join("Resources").join("platform-tools"))
+                    .unwrap_or_default(),
+            ] {
+                let candidate = directory.join(executable);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
     if let Some(paths) = env::var_os("PATH") {
         for directory in env::split_paths(&paths) {
             let candidate = directory.join(executable);
