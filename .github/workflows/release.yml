@@ -1,0 +1,118 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS universal
+            os: macos-latest
+          - name: Windows x64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build macOS universal application
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+          APP="dist/TV Assistant.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          lipo -create \
+            target/aarch64-apple-darwin/release/tv-assistant \
+            target/x86_64-apple-darwin/release/tv-assistant \
+            -output "$APP/Contents/MacOS/tv-assistant"
+          cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
+          cp -R assets/icons "$APP/Contents/Resources/icons"
+
+          qlmanage -t -s 1024 -o assets assets/AppIcon.svg >/dev/null
+          mv assets/AppIcon.svg.png assets/AppIcon.png
+          mkdir -p assets/AppIcon.iconset
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" assets/AppIcon.png --out "assets/AppIcon.iconset/icon_${size}x${size}.png" >/dev/null
+            double=$((size * 2))
+            sips -z "$double" "$double" assets/AppIcon.png --out "assets/AppIcon.iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns assets/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          ditto -c -k --keepParent "$APP" dist/TV-Assistant-macOS-universal.zip
+
+      - name: Build Windows application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory -Force -Path "dist/package/Resources" | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/tv-assistant.exe" "dist/package/tv-assistant.exe"
+          Copy-Item -Recurse "assets/icons" "dist/package/Resources/icons"
+          Compress-Archive -Path "dist/package/*" -DestinationPath "dist/TV-Assistant-Windows-x64.zip" -Force
+
+      - name: Upload macOS package
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TV-Assistant-macOS-universal
+          path: dist/TV-Assistant-macOS-universal.zip
+          if-no-files-found: error
+
+      - name: Upload Windows package
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TV-Assistant-Windows-x64
+          path: dist/TV-Assistant-Windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish prerelease
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v0.1.${{ github.run_number }}"
+          gh release create "$tag" artifacts/**/*.zip \
+            --title "TV Assistant $tag" \
+            --notes "Автоматическая сборка для macOS universal и Windows x64. Исходники: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}" \
+            --prerelease
