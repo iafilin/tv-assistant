@@ -111,6 +111,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -123,6 +125,7 @@ jobs:
           set -euo pipefail
           tag="v0.1.${{ github.run_number }}"
           gh release create "$tag" artifacts/**/*.zip \
+            --repo "${GITHUB_REPOSITORY}" \
             --title "TV Assistant $tag" \
             --notes "Автоматическая сборка для macOS universal и Windows x64. Исходники: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}" \
             --prerelease
