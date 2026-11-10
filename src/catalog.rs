@@ -1,6 +1,7 @@
 use crate::adb::{Adb, DeviceSnapshot, app_directory, download};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -168,16 +169,32 @@ pub fn fetch_catalog(device: &DeviceSnapshot) -> Result<Vec<CatalogItem>> {
     Ok(items)
 }
 
-pub fn install_catalog_app(
-    device: &DeviceSnapshot,
-    item: &CatalogItem,
-) -> Result<(String, DeviceSnapshot)> {
+pub fn download_catalog_app(device: &DeviceSnapshot, item: &CatalogItem) -> Result<PathBuf> {
     ensure_compatible(item, &device.android)?;
+    if let Some(available) = device.storage_available {
+        let required = item.size.saturating_mul(4);
+        if available < required {
+            bail!(
+                "Недостаточно места на ТВ: доступно {}. Для {} рекомендуется освободить не менее {}. Удалите ненужные приложения и повторите установку.",
+                format_size(available),
+                item.name,
+                format_size(required)
+            );
+        }
+    }
     let directory = app_directory()?.join("downloads");
     let apk = directory.join(&item.asset_name);
     download(&item.download_url, &apk, item.sha256.as_deref())?;
+    Ok(apk)
+}
+
+pub fn install_catalog_app(
+    device: &DeviceSnapshot,
+    item: &CatalogItem,
+    apk: &Path,
+) -> Result<(String, DeviceSnapshot)> {
     let adb = Adb::new()?;
-    let snapshot = adb.install_apk(&device.serial, &apk, &item.package)?;
+    let snapshot = adb.install_apk(&device.serial, apk, &item.package)?;
     Ok((
         format!("{} {} установлен на телевизор", item.name, item.version),
         snapshot,

@@ -41,6 +41,7 @@ pub struct DeviceSnapshot {
     pub android: String,
     pub abi: String,
     pub launcher: String,
+    pub storage_available: Option<u64>,
     pub packages: Vec<PackageInfo>,
 }
 
@@ -144,6 +145,10 @@ impl Adb {
                 .then(a.name.cmp(&b.name))
         });
 
+        let storage_available = self
+            .shell(serial, &["df", "-h", "/data"])
+            .ok()
+            .and_then(|output| parse_storage_available(&output));
         Ok(DeviceSnapshot {
             serial: serial.to_string(),
             brand,
@@ -151,6 +156,7 @@ impl Adb {
             android,
             abi,
             launcher,
+            storage_available,
             packages,
         })
     }
@@ -197,6 +203,49 @@ impl Adb {
         }
         if !errors.is_empty() {
             bail!("Часть операций не выполнена:\n{}", errors.join("\n"));
+        }
+        Ok(snapshot)
+    }
+
+    pub fn delete_packages(&self, serial: &str, packages: &[String]) -> Result<DeviceSnapshot> {
+        if packages.is_empty() {
+            bail!("Не выбраны сторонние приложения для удаления");
+        }
+        let before = self.inspect(serial)?;
+        let launcher_package = before
+            .launcher
+            .split('/')
+            .next()
+            .and_then(|value| value.rsplit('{').next())
+            .unwrap_or_default();
+        let mut errors = Vec::new();
+        for name in packages {
+            validate_package_name(name)?;
+            let Some(package) = before.packages.iter().find(|package| &package.name == name) else {
+                continue;
+            };
+            if !package.third_party || package.risk == Risk::Protected || launcher_package == *name
+            {
+                errors.push(format!("{name}: полное удаление запрещено"));
+                continue;
+            }
+            if let Err(error) = self.shell(serial, &["pm", "uninstall", "--user", "0", name]) {
+                errors.push(format!("{name}: {error}"));
+            }
+        }
+        let snapshot = self.inspect(serial)?;
+        for name in packages {
+            if snapshot
+                .packages
+                .iter()
+                .find(|package| &package.name == name)
+                .is_some_and(|package| package.installed)
+            {
+                errors.push(format!("{name}: приложение не удалено"));
+            }
+        }
+        if !errors.is_empty() {
+            bail!("Часть приложений не удалена:\n{}", errors.join("\n"));
         }
         Ok(snapshot)
     }
@@ -513,6 +562,24 @@ pub(crate) fn app_directory() -> Result<PathBuf> {
 
 pub(crate) fn path_text(path: &Path) -> Result<&str> {
     path.to_str().context("Некорректный путь к файлу")
+}
+
+fn parse_storage_available(output: &str) -> Option<u64> {
+    let value = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .last()?
+        .split_whitespace()
+        .rev()
+        .nth(2)?;
+    let (number, factor) = match value.chars().last()? {
+        'K' | 'k' => (&value[..value.len() - 1], 1024.),
+        'M' | 'm' => (&value[..value.len() - 1], 1024. * 1024.),
+        'G' | 'g' => (&value[..value.len() - 1], 1024. * 1024. * 1024.),
+        'T' | 't' => (&value[..value.len() - 1], 1024. * 1024. * 1024. * 1024.),
+        _ => (value, 1.),
+    };
+    Some((number.parse::<f64>().ok()? * factor) as u64)
 }
 
 fn validate_package_name(name: &str) -> Result<()> {

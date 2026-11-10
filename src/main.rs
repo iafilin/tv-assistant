@@ -163,6 +163,9 @@ fn main() {
                         device.brand, device.model, device.android, device.abi
                     );
                     println!("Серийный адрес: {}", device.serial);
+                    if let Some(available) = device.storage_available {
+                        println!("Свободно: {}", catalog::format_size(available));
+                    }
                     println!("Лаунчер: {}", device.launcher);
                     println!("Пакетов: {}", device.packages.len());
                     for package in device.packages.iter().filter(|package| package.running) {

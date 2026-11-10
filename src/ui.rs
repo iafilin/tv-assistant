@@ -1,6 +1,8 @@
 use crate::adb::{Adb, DeviceSnapshot, PackageInfo, Risk, discover_adb_devices};
 use crate::assets::{Assets, resource_path};
-use crate::catalog::{CatalogItem, fetch_catalog, format_size, install_catalog_app};
+use crate::catalog::{
+    CatalogItem, download_catalog_app, fetch_catalog, format_size, install_catalog_app,
+};
 use anyhow::Result;
 use gpui::{
     AnyElement, App, Application, Bounds, Context, ElementId, FocusHandle, KeyBinding,
@@ -47,6 +49,17 @@ enum Page {
     Guide,
 }
 
+#[derive(Clone, Copy)]
+enum InstallStage {
+    Downloading,
+    Installing,
+}
+
+struct InstallingApp {
+    id: String,
+    stage: InstallStage,
+}
+
 pub struct TvAssistant {
     page: Page,
     focus_handle: FocusHandle,
@@ -61,8 +74,11 @@ pub struct TvAssistant {
     status: String,
     logs: Vec<String>,
     confirm_disable: bool,
+    confirm_delete: bool,
     catalog: Vec<CatalogItem>,
     catalog_loaded: bool,
+    installing: Option<InstallingApp>,
+    install_error: Option<(String, String)>,
 }
 
 impl TvAssistant {
@@ -103,8 +119,11 @@ impl TvAssistant {
                 "Приложение готово. Изменения выполняются только по вашей команде.".to_string(),
             ],
             confirm_disable: false,
+            confirm_delete: false,
             catalog: Vec::new(),
             catalog_loaded: false,
+            installing: None,
+            install_error: None,
         }
     }
 
@@ -289,27 +308,67 @@ impl TvAssistant {
             return;
         };
         self.busy = true;
-        self.status = format!("Установка {}…", item.name);
+        self.installing = Some(InstallingApp {
+            id: id.clone(),
+            stage: InstallStage::Downloading,
+        });
+        self.install_error = None;
+        self.status = format!("Скачивание {}…", item.name);
         self.log(format!("Загрузка {} из официального релиза", item.name));
         cx.notify();
+        let install_device = device.clone();
+        let install_item = item.clone();
         cx.spawn(async move |this, cx| {
             let task = cx
                 .background_executor()
-                .spawn(async move { install_catalog_app(&device, &item) });
+                .spawn(async move { download_catalog_app(&device, &item) });
             let result = task.await;
             this.update(cx, |this, cx| {
-                this.busy = false;
                 match result {
-                    Ok((message, snapshot)) => {
-                        this.status = message.clone();
-                        this.log(message);
-                        this.device = Some(snapshot);
-                        if let Some(item) = this.catalog.iter_mut().find(|item| item.id == id) {
-                            item.installed = true;
-                        }
+                    Ok(apk) => {
+                        this.installing = Some(InstallingApp {
+                            id: id.clone(),
+                            stage: InstallStage::Installing,
+                        });
+                        this.status = format!("Установка {} на телевизор…", install_item.name);
+                        this.log(format!("Установка {} на телевизор", install_item.name));
+                        cx.spawn(async move |this, cx| {
+                            let task = cx.background_executor().spawn(async move {
+                                install_catalog_app(&install_device, &install_item, &apk)
+                            });
+                            let result = task.await;
+                            this.update(cx, |this, cx| {
+                                this.busy = false;
+                                this.installing = None;
+                                match result {
+                                    Ok((message, snapshot)) => {
+                                        this.status = message.clone();
+                                        this.log(message);
+                                        this.device = Some(snapshot);
+                                        if let Some(item) =
+                                            this.catalog.iter_mut().find(|item| item.id == id)
+                                        {
+                                            item.installed = true;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        this.status = error.to_string();
+                                        this.install_error =
+                                            Some((id.clone(), format!("{error:#}")));
+                                        this.log(format!("Ошибка установки: {error:#}"));
+                                    }
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        })
+                        .detach();
                     }
                     Err(error) => {
+                        this.busy = false;
+                        this.installing = None;
                         this.status = error.to_string();
+                        this.install_error = Some((id.clone(), format!("{error:#}")));
                         this.log(format!("Ошибка установки: {error:#}"));
                     }
                 }
@@ -381,6 +440,54 @@ impl TvAssistant {
         .detach();
     }
 
+    fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(device) = self.device.as_ref() else {
+            return;
+        };
+        let serial = device.serial.clone();
+        let packages: Vec<String> = device
+            .packages
+            .iter()
+            .filter(|package| {
+                self.selected.contains(&package.name) && package.installed && package.third_party
+            })
+            .map(|package| package.name.clone())
+            .collect();
+        if packages.is_empty() {
+            self.status = "Выберите сторонние приложения для удаления".to_string();
+            cx.notify();
+            return;
+        }
+        if !self.confirm_delete {
+            self.confirm_delete = true;
+            self.confirm_disable = false;
+            self.status = format!(
+                "Подтвердите удаление приложений и их данных: {}",
+                packages.len()
+            );
+            cx.notify();
+            return;
+        }
+        self.confirm_delete = false;
+        self.busy = true;
+        self.status = "Удаление приложений и освобождение памяти…".to_string();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let task = cx
+                .background_executor()
+                .spawn(async move { Adb::new()?.delete_packages(&serial, &packages) });
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.finish_snapshot(result, "Приложения и их данные удалены", cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn finish_snapshot(
         &mut self,
         result: Result<DeviceSnapshot>,
@@ -388,6 +495,8 @@ impl TvAssistant {
         cx: &mut Context<Self>,
     ) {
         self.busy = false;
+        self.confirm_disable = false;
+        self.confirm_delete = false;
         match result {
             Ok(device) => {
                 self.status = message.to_string();
@@ -775,6 +884,17 @@ impl TvAssistant {
             .iter()
             .filter(|package| self.selected.contains(&package.name) && !package.installed)
             .count();
+        let delete_selected_count = device
+            .packages
+            .iter()
+            .filter(|package| {
+                self.selected.contains(&package.name) && package.installed && package.third_party
+            })
+            .count();
+        let storage = device
+            .storage_available
+            .map(format_size)
+            .unwrap_or_else(|| "неизвестно".to_string());
         let view = cx.entity();
         let mut list = div()
             .id("package-list")
@@ -817,7 +937,10 @@ impl TvAssistant {
                     .child(icon("grid", ACCENT, px(28.)))
                     .child(title("Пакеты и фоновые сервисы")),
             )
-            .child(subtitle(&format!("{} · отключение только для user 0, без root", device.serial)))
+            .child(subtitle(&format!(
+                "{} · отключение только для user 0, без root · свободно: {storage}",
+                device.serial
+            )))
             .child(
                 div()
                     .w_full()
@@ -839,6 +962,7 @@ impl TvAssistant {
                     .child(tool_button("clear-selection", "x", "Снять выбор", PANEL_ALT).on_click(cx.listener(|this, _, _, cx| {
                         this.selected.clear();
                         this.confirm_disable = false;
+                        this.confirm_delete = false;
                         cx.notify();
                     })))
                     .child(
@@ -855,7 +979,7 @@ impl TvAssistant {
             )
             .child(list);
 
-        if self.confirm_disable {
+        if self.confirm_delete {
             page = page.child(
                 card()
                     .border_color(RED)
@@ -868,6 +992,33 @@ impl TvAssistant {
                             .items_center()
                             .gap_2()
                             .child(icon("warning", RED, px(22.)))
+                            .child(label(&format!("Удалить приложения и их данные: {delete_selected_count}?"))),
+                    )
+                    .child(div().text_xs().text_color(MUTED).child("Это полное удаление сторонних приложений, а не отключение. Настройки и данные будут потеряны. Восстановить можно только повторной установкой."))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(tool_button("confirm-delete", "trash", "Удалить безвозвратно", RED).on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx))))
+                            .child(tool_button("cancel-delete", "x", "Отмена", PANEL_ALT).on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_delete = false;
+                                cx.notify();
+                            }))),
+                    ),
+            );
+        } else if self.confirm_disable {
+            page = page.child(
+                card()
+                    .border_color(ORANGE)
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(icon("warning", ORANGE, px(22.)))
                             .child(label(&format!("Отключить выбранные пакеты: {installed_selected}?"))),
                     )
                     .child(div().text_xs().text_color(MUTED).child("Проверьте названия. Восстановление доступно в этом же списке: отключённые пакеты останутся видны."))
@@ -875,7 +1026,7 @@ impl TvAssistant {
                         div()
                             .flex()
                             .gap_2()
-                            .child(tool_button("confirm-disable", "trash", "Подтвердить отключение", RED).on_click(cx.listener(|this, _, _, cx| this.change_packages(false, cx))))
+                            .child(tool_button("confirm-disable", "x", "Подтвердить отключение", ORANGE).on_click(cx.listener(|this, _, _, cx| this.change_packages(false, cx))))
                             .child(tool_button("cancel-disable", "x", "Отмена", PANEL_ALT).on_click(cx.listener(|this, _, _, cx| {
                                 this.confirm_disable = false;
                                 cx.notify();
@@ -886,13 +1037,14 @@ impl TvAssistant {
             page = page.child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_2()
                     .child(
                         tool_button(
                             "disable-selected",
-                            "trash",
+                            "x",
                             format!("Отключить ({installed_selected})"),
-                            RED,
+                            ORANGE,
                         )
                         .on_click(cx.listener(|this, _, _, cx| this.change_packages(false, cx))),
                     )
@@ -904,6 +1056,15 @@ impl TvAssistant {
                             GREEN,
                         )
                         .on_click(cx.listener(|this, _, _, cx| this.change_packages(true, cx))),
+                    )
+                    .child(
+                        tool_button(
+                            "delete-selected",
+                            "trash",
+                            format!("Удалить ({delete_selected_count})"),
+                            RED,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx))),
                     ),
             );
         }
@@ -915,6 +1076,12 @@ impl TvAssistant {
             return empty_state("Подключите телевизор, чтобы открыть каталог", cx)
                 .into_any_element();
         }
+        let storage = self
+            .device
+            .as_ref()
+            .and_then(|device| device.storage_available)
+            .map(format_size)
+            .unwrap_or_else(|| "неизвестно".to_string());
         let mut page = div()
             .w_full()
             .h_full()
@@ -940,9 +1107,9 @@ impl TvAssistant {
                             .on_click(cx.listener(|this, _, _, cx| this.load_catalog(cx))),
                     ),
             )
-            .child(subtitle(
-                "Официальные релизы · выбор APK под архитектуру ТВ · проверка SHA-256",
-            ));
+            .child(subtitle(&format!(
+                "Официальные релизы · выбор APK под архитектуру ТВ · проверка SHA-256 · свободно: {storage}"
+            )));
 
         if self.catalog.is_empty() {
             page = page.child(
@@ -968,7 +1135,13 @@ impl TvAssistant {
                 .flex_wrap()
                 .gap_3();
             for item in self.catalog.clone() {
-                list = list.child(catalog_card(item, cx));
+                list = list.child(catalog_card(
+                    item,
+                    self.installing.as_ref(),
+                    self.install_error.as_ref(),
+                    self.busy,
+                    cx,
+                ));
             }
             page = page.child(list);
         }
@@ -1189,11 +1362,50 @@ fn run_with_page(initial_device: Option<DeviceSnapshot>, initial_page: Page) {
         });
 }
 
-fn catalog_card(item: CatalogItem, cx: &mut Context<TvAssistant>) -> gpui::Div {
+fn catalog_card(
+    item: CatalogItem,
+    installing: Option<&InstallingApp>,
+    install_error: Option<&(String, String)>,
+    busy: bool,
+    cx: &mut Context<TvAssistant>,
+) -> gpui::Div {
     let id = item.id.clone();
-    card()
+    let stage = installing
+        .filter(|progress| progress.id == item.id)
+        .map(|progress| progress.stage);
+    let error = install_error
+        .and_then(|(id, message)| (id.as_str() == item.id.as_str()).then_some(message));
+    let button = if let Some(stage) = stage {
+        disabled_tool_button(
+            SharedString::from(format!("install-{id}")),
+            "refresh",
+            match stage {
+                InstallStage::Downloading => "Скачивание…",
+                InstallStage::Installing => "Установка…",
+            },
+        )
+    } else if busy {
+        disabled_tool_button(
+            SharedString::from(format!("install-{id}")),
+            "lock",
+            "Подождите",
+        )
+    } else {
+        tool_button(
+            SharedString::from(format!("install-{id}")),
+            "download",
+            if item.installed {
+                "Переустановить"
+            } else {
+                "Установить"
+            },
+            if item.installed { PANEL_ALT } else { ACCENT },
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.install_catalog_item(id.clone(), cx)))
+    };
+    let mut result = card()
         .w(px(430.))
-        .h(px(205.))
+        .h(if error.is_some() { px(245.) } else { px(205.) })
         .flex()
         .flex_col()
         .gap_2()
@@ -1241,37 +1453,23 @@ fn catalog_card(item: CatalogItem, cx: &mut Context<TvAssistant>) -> gpui::Div {
                 .text_sm()
                 .text_color(MUTED)
                 .child(item.description.clone()),
-        )
-        .child(div().flex_1())
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(MUTED)
-                        .child(format!("APK · {}", format_size(item.size))),
-                )
-                .child(
-                    tool_button(
-                        SharedString::from(format!("install-{id}")),
-                        "download",
-                        if item.installed {
-                            "Переустановить"
-                        } else {
-                            "Установить"
-                        },
-                        if item.installed { PANEL_ALT } else { ACCENT },
-                    )
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            this.install_catalog_item(id.clone(), cx)
-                        }),
-                    ),
-                ),
-        )
+        );
+    if let Some(error) = error {
+        result = result.child(div().text_xs().text_color(RED).child(friendly_error(error)));
+    }
+    result.child(div().flex_1()).child(
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(MUTED)
+                    .child(format!("APK · {}", format_size(item.size))),
+            )
+            .child(button),
+    )
 }
 
 fn package_row(
@@ -1469,6 +1667,33 @@ fn tool_button(
         .child(icon(icon_name, TEXT, px(17.)))
         .child(label)
         .hover(move |style| style.bg(color.blend(rgb(0x101010))))
+}
+
+fn disabled_tool_button(
+    id: impl Into<ElementId>,
+    icon_name: &'static str,
+    label: impl IntoElement,
+) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .bg(PANEL_ALT)
+        .rounded_md()
+        .px_3()
+        .py_2()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_color(MUTED)
+        .child(icon(icon_name, MUTED, px(17.)))
+        .child(label)
+}
+
+fn friendly_error(error: &str) -> String {
+    if error.contains("INSTALL_FAILED_INSUFFICIENT_STORAGE") {
+        "Недостаточно места на ТВ. Удалите ненужные приложения и повторите установку.".to_string()
+    } else {
+        error.to_string()
+    }
 }
 
 fn badge(text: impl IntoElement, color: Rgba, background: Rgba, width: gpui::Pixels) -> gpui::Div {
